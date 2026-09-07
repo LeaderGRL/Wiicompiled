@@ -2,6 +2,7 @@
 
 #include "../gfx/modern/scene_renderer.hpp"
 #include "../webgpu/gpu.hpp"
+#include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
 #include "tracy/Tracy.hpp"
@@ -14,6 +15,15 @@
 
 namespace aurora::gx {
 static Module Log("aurora::gx");
+
+SceneDrawMetadata capture_scene_draw_metadata() noexcept {
+  // This runs while the producer owns the renderer GPU mutex and constructs the sealed DrawData.
+  // The asynchronous frame worker only consumes the copied fields later and never touches g_gxState.
+  return {
+      .projectionType = g_gxState.projType,
+      .currentPnMtx = g_gxState.currentPnMtx,
+  };
+}
 
 namespace {
 struct ShaderConfigHash {
