@@ -8,10 +8,12 @@
 #include "tracy/Tracy.hpp"
 
 #include <condition_variable>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 namespace aurora::gx {
 static Module Log("aurora::gx");
@@ -24,6 +26,65 @@ SceneAttrSource capture_attr_source(GXAttr attr) noexcept {
       .size = source.size,
       .stride = source.stride,
   };
+}
+
+bool environment_flag(const char* name) noexcept {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+const bool sInspectSceneDraws = environment_flag("AURORA_MODERN_SCENE_INSPECT");
+
+struct SceneDrawInspectKey {
+  uintptr_t positionAddress = 0;
+  uintptr_t normalAddress = 0;
+  uintptr_t tex0Address = 0;
+  uintptr_t pipeline = 0;
+  uint32_t vertexCount = 0;
+  uint32_t indexCount = 0;
+  uint32_t positionStride = 0;
+
+  bool operator==(const SceneDrawInspectKey&) const = default;
+
+  template <typename H>
+  friend H AbslHashValue(H h, const SceneDrawInspectKey& key) {
+    return H::combine(std::move(h), key.positionAddress, key.normalAddress, key.tex0Address,
+                      key.pipeline, key.vertexCount, key.indexCount, key.positionStride);
+  }
+};
+
+std::mutex sSceneInspectMutex;
+absl::flat_hash_set<SceneDrawInspectKey> sSeenSceneDraws;
+constexpr size_t kMaximumLoggedSceneDraws = 256;
+
+void inspect_scene_draw(const DrawData& data) {
+  if (!sInspectSceneDraws || data.scene.projectionType != GX_PERSPECTIVE) {
+    return;
+  }
+
+  const SceneDrawInspectKey key{
+      .positionAddress = data.scene.positionSource.address,
+      .normalAddress = data.scene.normalSource.address,
+      .tex0Address = data.scene.tex0Source.address,
+      .pipeline = static_cast<uintptr_t>(data.pipeline),
+      .vertexCount = data.vtxCount,
+      .indexCount = data.indexCount,
+      .positionStride = data.scene.positionSource.stride,
+  };
+
+  std::lock_guard lock{sSceneInspectMutex};
+  if (sSeenSceneDraws.size() >= kMaximumLoggedSceneDraws || !sSeenSceneDraws.insert(key).second) {
+    return;
+  }
+
+  Log.info(
+      "MKART_DRAW id={} pos=0x{:x} posSize={} posStride={} nrm=0x{:x} nrmSize={} nrmStride={} "
+      "tex0=0x{:x} tex0Size={} tex0Stride={} vtx={} idx={} pipeline=0x{:x} pnMtx={}",
+      sSeenSceneDraws.size() - 1, data.scene.positionSource.address, data.scene.positionSource.size,
+      data.scene.positionSource.stride, data.scene.normalSource.address, data.scene.normalSource.size,
+      data.scene.normalSource.stride, data.scene.tex0Source.address, data.scene.tex0Source.size,
+      data.scene.tex0Source.stride, data.vtxCount, data.indexCount,
+      static_cast<uintptr_t>(data.pipeline), data.scene.currentPnMtx);
 }
 } // namespace
 
@@ -118,6 +179,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, DrawEncod
   }
   pass.DrawIndexed(data.indexCount, data.instanceCount,
                    static_cast<uint32_t>(data.idxRange.offset / sizeof(uint16_t)));
+
+  inspect_scene_draw(data);
+
+  // Inspection mode is intentionally non-invasive: render the original GX stream and only log
+  // stable resource identities. This lets us classify menu/course/character draws before enabling
+  // a replacement on a specific mesh.
+  if (sInspectSceneDraws) {
+    return;
+  }
 
   // Only perspective draws can provide a usable scene camera. This metadata was captured on the
   // producer thread together with the draw, so the async frame worker never reads mutable GX state.
