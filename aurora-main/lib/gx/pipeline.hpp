@@ -3,7 +3,19 @@
 #include "../gfx/common.hpp"
 #include "shader_info.hpp"
 
+#include <cstdint>
+
 namespace aurora::gx {
+
+// Lightweight source identity for a GX attribute array. The pointer is captured on the producer
+// thread together with the draw and is therefore safe for the asynchronous frame worker to inspect.
+// It is used by the modern renderer to distinguish actual game resources from unrelated 3D menu
+// draws without hashing vertex payloads every frame.
+struct SceneAttrSource {
+  uintptr_t address = 0;
+  uint32_t size = 0;
+  uint32_t stride = 0;
+};
 
 // Immutable metadata captured while a GX draw is recorded. The frame worker may encode the draw
 // after the producer has already started the next frame, so modern rendering code must consume this
@@ -11,6 +23,9 @@ namespace aurora::gx {
 struct SceneDrawMetadata {
   GXProjectionType projectionType = GX_ORTHOGRAPHIC;
   uint32_t currentPnMtx = 0;
+  SceneAttrSource positionSource{};
+  SceneAttrSource normalSource{};
+  SceneAttrSource tex0Source{};
 };
 
 // Evaluated on the producer thread by DrawData's default member initializer. Keeping the capture in
