@@ -105,11 +105,12 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, DrawEncod
   pass.DrawIndexed(data.indexCount, data.instanceCount,
                    static_cast<uint32_t>(data.idxRange.offset / sizeof(uint16_t)));
 
-  // The modern scene path runs immediately after a suitable sealed GX draw. At this point the
-  // render pass still has that draw's viewport/scissor/depth attachments, which is the safest
-  // possible place to validate a parallel 3D renderer without reading mutable producer state.
+  // Only perspective draws can provide a usable scene camera. This metadata was captured on the
+  // producer thread together with the draw, so the async frame worker never reads mutable GX state.
   const bool modernSceneWasDrawn = state.modernSceneDrawn;
-  gfx::modern_scene::render_after_gx_draw(data, uniformRange, pass, state);
+  if (data.scene.projectionType == GX_PERSPECTIVE) {
+    gfx::modern_scene::render_after_gx_draw(data, uniformRange, pass, state);
+  }
 
   if (!modernSceneWasDrawn && state.modernSceneDrawn) {
     // The POC uses a different pipeline layout and temporarily occupies bind-group slot 0.
