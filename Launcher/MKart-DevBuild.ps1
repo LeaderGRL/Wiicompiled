@@ -5,7 +5,8 @@ param(
     [switch]$BootstrapSourceBuild,
     [switch]$Run,
     [switch]$Diagnostic,
-    [switch]$IgnoreDepth
+    [switch]$IgnoreDepth,
+    [switch]$InspectDraws
 )
 
 $ErrorActionPreference = 'Stop'
@@ -142,12 +143,20 @@ Write-Host 'MKARTDEV: build published to Base\WiiCompiled.exe'
 
 if ($Run) {
     $env:AURORA_MODERN_SCENE_POC = '1'
-    if ($Diagnostic) {
+
+    if ($InspectDraws) {
+        $env:AURORA_MODERN_SCENE_INSPECT = '1'
+        Write-Host 'MKARTDEV: GX scene draw inspection enabled (renderer injection disabled).'
+    } else {
+        Remove-Item Env:AURORA_MODERN_SCENE_INSPECT -ErrorAction SilentlyContinue
+    }
+
+    if ($Diagnostic -and -not $InspectDraws) {
         $env:AURORA_MODERN_SCENE_DIAGNOSTIC = '1'
     } else {
         Remove-Item Env:AURORA_MODERN_SCENE_DIAGNOSTIC -ErrorAction SilentlyContinue
     }
-    if ($IgnoreDepth) {
+    if ($IgnoreDepth -and -not $InspectDraws) {
         $env:AURORA_MODERN_SCENE_IGNORE_DEPTH = '1'
     } else {
         Remove-Item Env:AURORA_MODERN_SCENE_IGNORE_DEPTH -ErrorAction SilentlyContinue
