@@ -98,6 +98,19 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, DrawEncod
   // The modern scene path runs immediately after a suitable sealed GX draw. At this point the
   // render pass still has that draw's viewport/scissor/depth attachments, which is the safest
   // possible place to validate a parallel 3D renderer without reading mutable producer state.
+  const bool modernSceneWasDrawn = state.modernSceneDrawn;
   gfx::modern_scene::render_after_gx_draw(data, uniformRange, pass, state);
+
+  if (!modernSceneWasDrawn && state.modernSceneDrawn) {
+    // The POC uses a different pipeline layout and temporarily occupies bind-group slot 0.
+    // Aurora normally binds the GX static group only once at render-pass start, so failing to
+    // restore it leaves the next GX draw with an incompatible bind group and can fault inside Dawn.
+    // Re-establish the complete GX binding baseline once after the injected draw. This is not a
+    // per-draw cost: the modern scene probe can execute at most once per render pass.
+    pass.SetBindGroup(0, gfx::g_staticBindGroup);
+    pass.SetBindGroup(1, gfx::g_uniformBindGroup, offsets.size(), offsets.data());
+    pass.SetBindGroup(2, g_emptyTextureBindGroup);
+    state.boundTextureBindGroup = g_emptyTextureBindGroup.Get();
+  }
 }
 } // namespace aurora::gx
