@@ -16,6 +16,8 @@ namespace {
 using webgpu::g_device;
 using webgpu::g_graphicsConfig;
 
+static Module Log("aurora::gfx::modern_scene");
+
 constexpr uint32_t kGxCameraBytes = 144;
 constexpr uint32_t kMinimumCandidateIndices = 300;
 
@@ -64,6 +66,10 @@ wgpu::RenderPipeline g_pipeline;
 wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_indexBuffer;
 std::atomic_bool g_initialized{false};
+std::atomic_bool g_loggedActivation{false};
+std::atomic_bool g_loggedMsaaRejection{false};
+std::atomic_bool g_loggedCandidate{false};
+std::atomic_bool g_loggedDraw{false};
 
 bool environment_flag(const char* name) noexcept {
   const char* value = std::getenv(name);
@@ -328,6 +334,10 @@ bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcep
   // Until pass sample-count metadata is carried in the sealed command, only run with MSAA disabled.
   // Then every main/offscreen render attachment is single-sampled and pipeline compatibility is exact.
   if (g_graphicsConfig.msaaSamples != 1) {
+    if (!g_loggedMsaaRejection.exchange(true, std::memory_order_relaxed)) {
+      Log.warn("POC rejected scene draws because MSAA sample count is {} (expected 1)",
+               g_graphicsConfig.msaaSamples);
+    }
     return false;
   }
 
@@ -343,8 +353,23 @@ bool enabled() noexcept { return g_enabled; }
 
 void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUniformRange,
                           const wgpu::RenderPassEncoder& pass, gx::DrawEncodeState& state) noexcept {
-  if (!g_enabled || state.modernSceneDrawn || !candidate_draw(draw, effectiveUniformRange)) {
+  if (!g_enabled || state.modernSceneDrawn) {
     return;
+  }
+
+  if (!g_loggedActivation.exchange(true, std::memory_order_relaxed)) {
+    Log.info("POC enabled: msaaSamples={} ignoreDepth={}", g_graphicsConfig.msaaSamples,
+             g_ignoreDepth ? "true" : "false");
+  }
+
+  if (!candidate_draw(draw, effectiveUniformRange)) {
+    return;
+  }
+
+  if (!g_loggedCandidate.exchange(true, std::memory_order_relaxed)) {
+    Log.info("Selected GX camera candidate: indices={} instances={} uniformOffset={} uniformSize={}",
+             draw.indexCount, draw.instanceCount, effectiveUniformRange.offset,
+             effectiveUniformRange.size);
   }
 
   initialize();
@@ -360,6 +385,11 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   pass.SetVertexBuffer(0, g_vertexBuffer, 0, sizeof(kCubeVertices));
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16, 0, sizeof(kCubeIndices));
   pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()));
+
+  if (!g_loggedDraw.exchange(true, std::memory_order_relaxed)) {
+    Log.info("Issued modern scene DrawIndexed: indices={} cameraUniformOffset={}",
+             kCubeIndices.size(), effectiveUniformRange.offset);
+  }
 
   state.modernSceneDrawn = true;
 
