@@ -21,9 +21,11 @@ using webgpu::g_graphicsConfig;
 
 static Module Log("aurora::gfx::modern_scene");
 
-constexpr uint32_t kGxCameraBytes = 144;
+// GX triangle draws place the 80-byte scalar/array header first, followed by the 64-byte
+// effective projection and then at least one 48-byte post-transform matrix.
+constexpr uint32_t kGxCameraBytes = 192;
 constexpr uint32_t kMinimumCandidateIndices = 300;
-constexpr const char* kRendererBuildId = "scene-poc-r5";
+constexpr const char* kRendererBuildId = "scene-poc-r6";
 
 struct Vertex {
   float px;
@@ -36,7 +38,7 @@ struct Vertex {
 static_assert(sizeof(Vertex) == 24);
 
 struct SceneParams {
-  // xyz = camera-space translation, w = uniform scale.
+  // xyz = local-space translation, w = uniform scale.
   std::array<float, 4> translationScale{};
   // x = metallic, y = roughness, z = diagnostic mode, w = exposure.
   std::array<float, 4> material{};
@@ -111,7 +113,7 @@ SceneParams build_scene_params() noexcept {
       .translationScale = {
           environment_float("AURORA_MODERN_SCENE_X", 0.0f, -100000.0f, 100000.0f),
           environment_float("AURORA_MODERN_SCENE_Y", 0.0f, -100000.0f, 100000.0f),
-          environment_float("AURORA_MODERN_SCENE_Z", -650.0f, -100000.0f, 100000.0f),
+          environment_float("AURORA_MODERN_SCENE_Z", 0.0f, -100000.0f, 100000.0f),
           environment_float("AURORA_MODERN_SCENE_SCALE", 82.0f, 0.01f, 10000.0f),
       },
       .material = {
@@ -168,6 +170,7 @@ const PI: f32 = 3.14159265359;
 struct GxCameraUniform {
     header: array<vec4<u32>, 5>,
     projection: mat4x4<f32>,
+    modelView: mat3x4<f32>,
 };
 
 struct SceneParams {
@@ -225,51 +228,39 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
                  vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-fn diagnostic_translation(index: u32) -> vec3<f32> {
-    if (index == 0u) { return vec3<f32>(-220.0, 0.0, -650.0); }
-    if (index == 1u) { return vec3<f32>( 220.0, 0.0,  650.0); }
-    if (index == 2u) { return vec3<f32>(0.0, -160.0, -260.0); }
-    return vec3<f32>(0.0, 160.0, 260.0);
-}
-
 fn diagnostic_tint(index: u32) -> vec3<f32> {
-    if (index == 0u) { return vec3<f32>(1.0, 0.06, 0.02); }
-    if (index == 1u) { return vec3<f32>(0.02, 0.75, 1.0); }
-    if (index == 2u) { return vec3<f32>(0.10, 1.0, 0.20); }
-    if (index == 3u) { return vec3<f32>(1.0, 0.05, 0.85); }
-    return vec3<f32>(1.0, 0.92, 0.05);
+    if (index == 0u) { return vec3<f32>(1.0, 0.20, 0.02); }
+    return vec3<f32>(0.02, 0.78, 1.0);
 }
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     let diagnosticMode = scene.material.z > 0.5;
-    let clipProbe = diagnosticMode && input.instanceIndex == 4u;
-    let translation = select(scene.translationScale.xyz,
-                             diagnostic_translation(input.instanceIndex), diagnosticMode);
+    let cameraSpaceControl = diagnosticMode && input.instanceIndex == 1u;
     let scale = scene.translationScale.w;
-    let viewPosition = input.position * scale + translation;
+    let localPosition = input.position * scale + scene.translationScale.xyz;
+
+    // Match Aurora's normal GX transform path: local-space position first enters the currently
+    // selected post-transform matrix, then the effective GX projection.
+    var viewPosition = vec4<f32>(localPosition, 1.0) * gxCamera.modelView;
+    var viewNormal = vec4<f32>(input.normal, 0.0) * gxCamera.modelView;
+
+    // The second diagnostic instance deliberately bypasses model-view. It remains a known-good
+    // camera-space control while instance 0 validates the draw-local transform bridge.
+    if (cameraSpaceControl) {
+        viewPosition = input.position * scale + vec3<f32>(-220.0, 0.0, -650.0);
+        viewNormal = input.normal;
+    }
 
     output.viewPosition = viewPosition;
-    output.normal = input.normal;
+    output.normal = normalize(viewNormal);
     output.tint = select(vec3<f32>(0.96, 0.23, 0.035),
                          diagnostic_tint(input.instanceIndex), diagnosticMode);
 
-    // Aurora uses reversed Z for GX rendering. Its generated GX vertex shader negates clip-space Z
-    // after multiplying by the effective GX projection. Mirror that exact convention here; depth
-    // comparison being disabled does not disable WebGPU clip-volume rejection.
     var clipPosition = vec4<f32>(viewPosition, 1.0) * gxCamera.projection;
+    // Aurora uses reversed Z and negates clip-space Z after projection.
     clipPosition.z = -clipPosition.z;
-
-    // Instance 4 is a deterministic rasterization probe. It bypasses the GX camera entirely and
-    // draws in clip space, so diagnostic mode can distinguish a camera bridge issue from a render
-    // pass/pipeline issue in a single run.
-    if (clipProbe) {
-        clipPosition = vec4<f32>(input.position.xy * 0.10 + vec2<f32>(-0.78, 0.72), 0.5, 1.0);
-        output.viewPosition = vec3<f32>(0.0, 0.0, -1.0);
-        output.normal = vec3<f32>(0.0, 0.0, 1.0);
-    }
-
     output.clipPosition = clipPosition;
     return output;
 }
@@ -389,7 +380,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   const wgpu::DepthStencilState depthState{
       .format = g_graphicsConfig.depthFormat,
       .depthWriteEnabled = false,
-      .depthCompare = g_ignoreDepth ? wgpu::CompareFunction::Always : wgpu::CompareFunction::LessEqual,
+      .depthCompare = g_ignoreDepth ? wgpu::CompareFunction::Always : wgpu::CompareFunction::GreaterEqual,
   };
   const wgpu::RenderPipelineDescriptor pipelineDescriptor{
       .label = "MKart Modern Scene PBR Pipeline",
@@ -436,10 +427,11 @@ bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcep
     return false;
   }
 
-  // Only perspective draws are valid camera anchors. Orthographic menu/HUD draws may have large
-  // meshes and uniform blocks too, so index count alone is not a sufficient scene classifier.
-  return draw.scene.projectionType == GX_PERSPECTIVE && draw.instanceCount == 1 &&
-         draw.indexCount >= kMinimumCandidateIndices && uniformRange.size >= kGxCameraBytes;
+  // currentPnMtx == 0 guarantees that the first uploaded post-transform matrix is the draw's active
+  // model-view matrix in both Aurora's absolute and compact matrix layouts.
+  return draw.scene.projectionType == GX_PERSPECTIVE && draw.scene.currentPnMtx == 0 &&
+         draw.instanceCount == 1 && draw.indexCount >= kMinimumCandidateIndices &&
+         uniformRange.size >= kGxCameraBytes;
 }
 
 } // namespace
@@ -454,11 +446,10 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
 
   if (!g_loggedActivation.exchange(true, std::memory_order_relaxed)) {
     const SceneParams params = build_scene_params();
-    Log.info("POC enabled: build={} msaaSamples={} ignoreDepth={} diagnostic={} reversedZ=true clipProbe={} position=({}, {}, {}) scale={} metallic={} roughness={}",
+    Log.info("POC enabled: build={} msaaSamples={} ignoreDepth={} diagnostic={} reversedZ=true modelView=true position=({}, {}, {}) scale={} metallic={} roughness={}",
              kRendererBuildId, g_graphicsConfig.msaaSamples, g_ignoreDepth ? "true" : "false",
-             g_diagnostic ? "true" : "false", g_diagnostic ? "true" : "false",
-             params.translationScale[0], params.translationScale[1], params.translationScale[2],
-             params.translationScale[3], params.material[0], params.material[1]);
+             g_diagnostic ? "true" : "false", params.translationScale[0], params.translationScale[1],
+             params.translationScale[2], params.translationScale[3], params.material[0], params.material[1]);
   }
 
   if (!candidate_draw(draw, effectiveUniformRange)) {
@@ -466,7 +457,7 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   }
 
   if (!g_loggedCandidate.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Selected GX perspective camera: indices={} instances={} uniformOffset={} uniformSize={} projectionType={} currentPnMtx={} projectionOffset=80",
+    Log.info("Selected GX model-view anchor: indices={} instances={} uniformOffset={} uniformSize={} projectionType={} currentPnMtx={} projectionOffset=80 modelViewOffset=144",
              draw.indexCount, draw.instanceCount, effectiveUniformRange.offset, effectiveUniformRange.size,
              static_cast<uint32_t>(draw.scene.projectionType), draw.scene.currentPnMtx);
   }
@@ -481,11 +472,11 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   pass.SetBindGroup(0, g_sceneBindGroup, dynamicOffsets.size(), dynamicOffsets.data());
   pass.SetVertexBuffer(0, g_vertexBuffer, 0, sizeof(kCubeVertices));
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16, 0, sizeof(kCubeIndices));
-  const uint32_t instanceCount = g_diagnostic ? 5u : 1u;
+  const uint32_t instanceCount = g_diagnostic ? 2u : 1u;
   pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()), instanceCount);
 
   if (!g_loggedDraw.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Issued modern scene DrawIndexed: build={} indices={} instances={} cameraUniformOffset={}",
+    Log.info("Issued modern scene DrawIndexed: build={} indices={} instances={} cameraUniformOffset={} modelView=true",
              kRendererBuildId, kCubeIndices.size(), instanceCount, effectiveUniformRange.offset);
   }
 
