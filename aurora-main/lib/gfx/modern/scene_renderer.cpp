@@ -4,6 +4,7 @@
 #include "../../gx/pipeline.hpp"
 #include "../../webgpu/gpu.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -383,8 +384,6 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
       .primitive = wgpu::PrimitiveState{
           .topology = wgpu::PrimitiveTopology::TriangleList,
           .frontFace = wgpu::FrontFace::CCW,
-          // Disabled while validating the GX camera convention. Back-face culling is restored once
-          // the handedness is known, avoiding another source of false negatives during bring-up.
           .cullMode = wgpu::CullMode::None,
       },
       .depthStencil = &depthState,
