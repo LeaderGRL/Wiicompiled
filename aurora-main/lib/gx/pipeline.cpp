@@ -16,12 +16,26 @@
 namespace aurora::gx {
 static Module Log("aurora::gx");
 
+namespace {
+SceneAttrSource capture_attr_source(GXAttr attr) noexcept {
+  const auto& source = g_gxState.arrays[static_cast<size_t>(attr)];
+  return {
+      .address = reinterpret_cast<uintptr_t>(source.data),
+      .size = source.size,
+      .stride = source.stride,
+  };
+}
+} // namespace
+
 SceneDrawMetadata capture_scene_draw_metadata() noexcept {
   // This runs while the producer owns the renderer GPU mutex and constructs the sealed DrawData.
   // The asynchronous frame worker only consumes the copied fields later and never touches g_gxState.
   return {
       .projectionType = g_gxState.projType,
       .currentPnMtx = g_gxState.currentPnMtx,
+      .positionSource = capture_attr_source(GX_VA_POS),
+      .normalSource = capture_attr_source(GX_VA_NRM),
+      .tex0Source = capture_attr_source(GX_VA_TEX0),
   };
 }
 
@@ -61,7 +75,7 @@ wgpu::ShaderModule cached_shader_module(const ShaderConfig& config) {
     entry->compiling = false;
   }
   entry->ready.notify_all();
-  return module;
+  return entry->module;
 }
 } // namespace
 
