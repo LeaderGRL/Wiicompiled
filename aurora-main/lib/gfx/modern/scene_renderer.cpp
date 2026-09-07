@@ -5,7 +5,9 @@
 #include "../../webgpu/gpu.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace aurora::gfx::modern_scene {
@@ -13,7 +15,6 @@ namespace {
 
 using webgpu::g_device;
 using webgpu::g_graphicsConfig;
-using webgpu::g_queue;
 
 constexpr uint32_t kGxCameraBytes = 144;
 constexpr uint32_t kMinimumCandidateIndices = 300;
@@ -62,7 +63,7 @@ wgpu::PipelineLayout g_pipelineLayout;
 wgpu::RenderPipeline g_pipeline;
 wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_indexBuffer;
-bool g_initialized = false;
+std::atomic_bool g_initialized{false};
 
 bool environment_flag(const char* name) noexcept {
   const char* value = std::getenv(name);
@@ -72,22 +73,27 @@ bool environment_flag(const char* name) noexcept {
 const bool g_enabled = environment_flag("AURORA_MODERN_SCENE_POC");
 const bool g_ignoreDepth = environment_flag("AURORA_MODERN_SCENE_IGNORE_DEPTH");
 
-void create_geometry() {
-  const wgpu::BufferDescriptor vertexDescriptor{
-      .label = "MKart Modern Scene Cube Vertices",
-      .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-      .size = sizeof(kCubeVertices),
+template <typename T, size_t N>
+wgpu::Buffer create_static_buffer(const std::array<T, N>& source, wgpu::BufferUsage usage, const char* label) {
+  const wgpu::BufferDescriptor descriptor{
+      .label = label,
+      .usage = usage,
+      .size = sizeof(source),
+      .mappedAtCreation = true,
   };
-  g_vertexBuffer = g_device.CreateBuffer(&vertexDescriptor);
-  g_queue.WriteBuffer(g_vertexBuffer, 0, kCubeVertices.data(), sizeof(kCubeVertices));
+  auto buffer = g_device.CreateBuffer(&descriptor);
+  std::memcpy(buffer.GetMappedRange(0, sizeof(source)), source.data(), sizeof(source));
+  buffer.Unmap();
+  return buffer;
+}
 
-  const wgpu::BufferDescriptor indexDescriptor{
-      .label = "MKart Modern Scene Cube Indices",
-      .usage = wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
-      .size = sizeof(kCubeIndices),
-  };
-  g_indexBuffer = g_device.CreateBuffer(&indexDescriptor);
-  g_queue.WriteBuffer(g_indexBuffer, 0, kCubeIndices.data(), sizeof(kCubeIndices));
+void create_geometry() {
+  // Mapped-at-creation avoids a queue write while a render pass is being encoded. These immutable
+  // buffers are initialized once, then shared by every frame without CPU/GPU synchronization.
+  g_vertexBuffer = create_static_buffer(kCubeVertices, wgpu::BufferUsage::Vertex,
+                                        "MKart Modern Scene Cube Vertices");
+  g_indexBuffer = create_static_buffer(kCubeIndices, wgpu::BufferUsage::Index,
+                                       "MKart Modern Scene Cube Indices");
 }
 
 void create_pipeline() {
@@ -175,7 +181,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let baseColor = vec3<f32>(0.96, 0.23, 0.035);
     let metallic = 0.72;
     let roughness = 0.22;
-    let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
+    let f0 = vec3<f32>(0.04) * (1.0 - metallic) + baseColor * metallic;
 
     let nDotL = max(dot(n, l), 0.0);
     let nDotV = max(dot(n, v), 0.0);
@@ -241,7 +247,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   };
   g_pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
 
-  constexpr std::array vertexAttributes{
+  const std::array vertexAttributes{
       wgpu::VertexAttribute{
           .format = wgpu::VertexFormat::Float32x3,
           .offset = 0,
@@ -253,7 +259,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
           .shaderLocation = 1,
       },
   };
-  constexpr std::array vertexLayouts{
+  const std::array vertexLayouts{
       wgpu::VertexBufferLayout{
           .arrayStride = sizeof(Vertex),
           .stepMode = wgpu::VertexStepMode::Vertex,
@@ -304,18 +310,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 void initialize() noexcept {
-  if (!g_enabled || g_initialized) {
+  if (!g_enabled || g_initialized.load(std::memory_order_acquire)) {
     return;
   }
 
   std::lock_guard lock{g_resourceMutex};
-  if (g_initialized) {
+  if (g_initialized.load(std::memory_order_relaxed)) {
     return;
   }
 
   create_geometry();
   create_pipeline();
-  g_initialized = true;
+  g_initialized.store(true, std::memory_order_release);
 }
 
 bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcept {
@@ -342,7 +348,7 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   }
 
   initialize();
-  if (!g_initialized) {
+  if (!g_initialized.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -353,7 +359,7 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   pass.SetBindGroup(0, g_cameraBindGroup, dynamicOffsets.size(), dynamicOffsets.data());
   pass.SetVertexBuffer(0, g_vertexBuffer, 0, sizeof(kCubeVertices));
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16, 0, sizeof(kCubeIndices));
-  pass.DrawIndexed(kCubeIndices.size());
+  pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()));
 
   state.modernSceneDrawn = true;
 
@@ -366,6 +372,7 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
 
 void shutdown() noexcept {
   std::lock_guard lock{g_resourceMutex};
+  g_initialized.store(false, std::memory_order_release);
   g_indexBuffer = {};
   g_vertexBuffer = {};
   g_pipeline = {};
@@ -373,7 +380,6 @@ void shutdown() noexcept {
   g_cameraBindGroup = {};
   g_cameraLayout = {};
   g_shaderModule = {};
-  g_initialized = false;
 }
 
 } // namespace aurora::gfx::modern_scene
