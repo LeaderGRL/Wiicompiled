@@ -11,6 +11,7 @@
 #include <SDL3/SDL_render.h>
 
 #include "fs_helper.hpp"
+#include "gfx/modern_renderer_poc.hpp"
 #include "internal.hpp"
 #include "webgpu/gpu.hpp"
 #include "window.hpp"
@@ -70,6 +71,7 @@ void initialize() noexcept {
     // frames of renderer resources to stop them overwriting each other's vertex/index buffers.
     info.NumFramesInFlight = 12;
     ImGui_ImplWGPU_Init(&info);
+    gfx::modern_poc::initialize();
   }
 }
 
@@ -78,6 +80,7 @@ void shutdown() noexcept {
   if (g_useSdlRenderer) {
     ImGui_ImplSDLRenderer3_Shutdown();
   } else {
+    gfx::modern_poc::shutdown();
     ImGui_ImplWGPU_Shutdown();
   }
   ImGui_ImplSDL3_Shutdown();
@@ -194,6 +197,9 @@ void render(const wgpu::RenderPassEncoder& pass) noexcept {
     ImGui_ImplSDLRenderer3_RenderDrawData(data, renderer);
     SDL_RenderPresent(renderer);
   } else {
+    const auto& config = webgpu::g_graphicsConfig.surfaceConfiguration;
+    gfx::modern_poc::render(pass, {.width = config.width, .height = config.height, .depthOrArrayLayers = 1});
+
     pass.PushDebugGroup("Aurora: Dear Imgui");
     ImGui_ImplWGPU_RenderDrawData(data, pass.Get());
     pass.PopDebugGroup();
