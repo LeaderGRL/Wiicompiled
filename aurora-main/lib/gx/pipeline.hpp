@@ -13,6 +13,11 @@ struct SceneDrawMetadata {
   uint32_t currentPnMtx = 0;
 };
 
+// Evaluated on the producer thread by DrawData's default member initializer. Keeping the capture in
+// the DrawData construction path means every producer (FIFO decode and raw bridge draws) gets the
+// same sealed scene metadata without duplicating call-site logic.
+SceneDrawMetadata capture_scene_draw_metadata() noexcept;
+
 struct DrawData {
   gfx::PipelineRef pipeline;
   gfx::Range vertRange;
@@ -24,7 +29,7 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
-  SceneDrawMetadata scene;
+  SceneDrawMetadata scene = capture_scene_draw_metadata();
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 19;
