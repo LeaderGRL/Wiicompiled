@@ -23,6 +23,7 @@ static Module Log("aurora::gfx::modern_scene");
 
 constexpr uint32_t kGxCameraBytes = 144;
 constexpr uint32_t kMinimumCandidateIndices = 300;
+constexpr const char* kRendererBuildId = "scene-poc-r4";
 
 struct Vertex {
   float px;
@@ -241,16 +242,16 @@ fn diagnostic_tint(index: u32) -> vec3<f32> {
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    let diagnostic = scene.material.z > 0.5;
+    let diagnosticMode = scene.material.z > 0.5;
     let translation = select(scene.translationScale.xyz,
-                             diagnostic_translation(input.instanceIndex), diagnostic);
+                             diagnostic_translation(input.instanceIndex), diagnosticMode);
     let scale = scene.translationScale.w;
     let viewPosition = input.position * scale + translation;
 
     output.viewPosition = viewPosition;
     output.normal = input.normal;
     output.tint = select(vec3<f32>(0.96, 0.23, 0.035),
-                         diagnostic_tint(input.instanceIndex), diagnostic);
+                         diagnostic_tint(input.instanceIndex), diagnosticMode);
     output.clipPosition = vec4<f32>(viewPosition, 1.0) * gxCamera.projection;
     return output;
 }
@@ -417,8 +418,10 @@ bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcep
     return false;
   }
 
-  return draw.instanceCount == 1 && draw.indexCount >= kMinimumCandidateIndices &&
-         uniformRange.size >= kGxCameraBytes;
+  // Only perspective draws are valid camera anchors. Orthographic menu/HUD draws may have large
+  // meshes and uniform blocks too, so index count alone is not a sufficient scene classifier.
+  return draw.scene.projectionType == GX_PERSPECTIVE && draw.instanceCount == 1 &&
+         draw.indexCount >= kMinimumCandidateIndices && uniformRange.size >= kGxCameraBytes;
 }
 
 } // namespace
@@ -433,8 +436,8 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
 
   if (!g_loggedActivation.exchange(true, std::memory_order_relaxed)) {
     const SceneParams params = build_scene_params();
-    Log.info("POC enabled: msaaSamples={} ignoreDepth={} diagnostic={} position=({}, {}, {}) scale={} metallic={} roughness={}",
-             g_graphicsConfig.msaaSamples, g_ignoreDepth ? "true" : "false",
+    Log.info("POC enabled: build={} msaaSamples={} ignoreDepth={} diagnostic={} position=({}, {}, {}) scale={} metallic={} roughness={}",
+             kRendererBuildId, g_graphicsConfig.msaaSamples, g_ignoreDepth ? "true" : "false",
              g_diagnostic ? "true" : "false", params.translationScale[0], params.translationScale[1],
              params.translationScale[2], params.translationScale[3], params.material[0], params.material[1]);
   }
@@ -444,7 +447,7 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   }
 
   if (!g_loggedCandidate.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Selected GX camera candidate: indices={} instances={} uniformOffset={} uniformSize={} projectionType={} currentPnMtx={}",
+    Log.info("Selected GX perspective camera: indices={} instances={} uniformOffset={} uniformSize={} projectionType={} currentPnMtx={}",
              draw.indexCount, draw.instanceCount, effectiveUniformRange.offset, effectiveUniformRange.size,
              static_cast<uint32_t>(draw.scene.projectionType), draw.scene.currentPnMtx);
   }
@@ -463,8 +466,8 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()), instanceCount);
 
   if (!g_loggedDraw.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Issued modern scene DrawIndexed: indices={} instances={} cameraUniformOffset={}",
-             kCubeIndices.size(), instanceCount, effectiveUniformRange.offset);
+    Log.info("Issued modern scene DrawIndexed: build={} indices={} instances={} cameraUniformOffset={}",
+             kRendererBuildId, kCubeIndices.size(), instanceCount, effectiveUniformRange.offset);
   }
 
   state.modernSceneDrawn = true;
