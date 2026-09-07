@@ -1,5 +1,6 @@
 #include "pipeline.hpp"
 
+#include "../gfx/modern/scene_renderer.hpp"
 #include "../webgpu/gpu.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
@@ -61,6 +62,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
 }
 
 void clear_shader_module_cache() {
+  gfx::modern_scene::shutdown();
   std::lock_guard lock{sShaderModuleCacheMutex};
   sShaderModuleCache.clear();
 }
@@ -92,5 +94,10 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, DrawEncod
   }
   pass.DrawIndexed(data.indexCount, data.instanceCount,
                    static_cast<uint32_t>(data.idxRange.offset / sizeof(uint16_t)));
+
+  // The modern scene path runs immediately after a suitable sealed GX draw. At this point the
+  // render pass still has that draw's viewport/scissor/depth attachments, which is the safest
+  // possible place to validate a parallel 3D renderer without reading mutable producer state.
+  gfx::modern_scene::render_after_gx_draw(data, uniformRange, pass, state);
 }
 } // namespace aurora::gx
