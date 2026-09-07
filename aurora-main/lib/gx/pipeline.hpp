@@ -70,6 +70,9 @@ struct DrawEncodeState {
   WGPUBindGroup boundTextureBindGroup = nullptr;
   // The pass-wide index buffer binding is established lazily by the first indexed draw; every draw then addresses it with firstIndex instead of a per-draw SetIndexBuffer.
   bool indexBufferBound = false;
+  // The modern scene POC injects at most one probe per GX render pass. Keeping this in the existing
+  // per-pass state makes the gate thread-local to the encoder and requires no shared synchronization.
+  bool modernSceneDrawn = false;
 };
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, DrawEncodeState& state,
