@@ -4,6 +4,15 @@
 #include "shader_info.hpp"
 
 namespace aurora::gx {
+
+// Immutable metadata captured while a GX draw is recorded. The frame worker may encode the draw
+// after the producer has already started the next frame, so modern rendering code must consume this
+// sealed snapshot instead of reading mutable g_gxState during replay.
+struct SceneDrawMetadata {
+  GXProjectionType projectionType = GX_ORTHOGRAPHIC;
+  uint32_t currentPnMtx = 0;
+};
+
 struct DrawData {
   gfx::PipelineRef pipeline;
   gfx::Range vertRange;
@@ -15,6 +24,7 @@ struct DrawData {
   uint32_t instanceCount;
   GXBindGroups bindGroups;
   uint32_t dstAlpha;
+  SceneDrawMetadata scene;
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 19;
@@ -68,7 +78,7 @@ struct DrawEncodeState {
   gfx::PipelineRef currentPipeline = UINTPTR_MAX;
   // The bind group currently occupying slot 2.
   WGPUBindGroup boundTextureBindGroup = nullptr;
-  // The pass-wide index buffer binding is established lazily by the first indexed draw; every draw then addresses it with firstIndex instead of a per-draw SetIndexBuffer.
+  // The pass-wide index buffer binding is established lazily by the first indexed draw; every draw then addresses its range with firstIndex instead of a per-draw SetIndexBuffer.
   bool indexBufferBound = false;
   // The modern scene POC injects at most one probe per GX render pass. Keeping this in the existing
   // per-pass state makes the gate thread-local to the encoder and requires no shared synchronization.
