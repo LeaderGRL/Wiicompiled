@@ -6,6 +6,8 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -31,8 +33,14 @@ struct Vertex {
 };
 static_assert(sizeof(Vertex) == 24);
 
-// Twenty-four vertices keep each cube face flat shaded and are also the shape we will later replace
-// with imported glTF vertex streams. The geometry is uploaded once and never rewritten per frame.
+struct SceneParams {
+  // xyz = camera-space translation, w = uniform scale.
+  std::array<float, 4> translationScale{};
+  // x = metallic, y = roughness, z = diagnostic mode, w = exposure.
+  std::array<float, 4> material{};
+};
+static_assert(sizeof(SceneParams) == 32);
+
 constexpr std::array<Vertex, 24> kCubeVertices{{
     {-1.f, -1.f,  1.f,  0.f,  0.f,  1.f}, { 1.f, -1.f,  1.f,  0.f,  0.f,  1.f},
     { 1.f,  1.f,  1.f,  0.f,  0.f,  1.f}, {-1.f,  1.f,  1.f,  0.f,  0.f,  1.f},
@@ -59,12 +67,13 @@ constexpr std::array<uint16_t, 36> kCubeIndices{{
 
 std::mutex g_resourceMutex;
 wgpu::ShaderModule g_shaderModule;
-wgpu::BindGroupLayout g_cameraLayout;
-wgpu::BindGroup g_cameraBindGroup;
+wgpu::BindGroupLayout g_sceneLayout;
+wgpu::BindGroup g_sceneBindGroup;
 wgpu::PipelineLayout g_pipelineLayout;
 wgpu::RenderPipeline g_pipeline;
 wgpu::Buffer g_vertexBuffer;
 wgpu::Buffer g_indexBuffer;
+wgpu::Buffer g_sceneParamsBuffer;
 std::atomic_bool g_initialized{false};
 std::atomic_bool g_loggedActivation{false};
 std::atomic_bool g_loggedMsaaRejection{false};
@@ -76,11 +85,45 @@ bool environment_flag(const char* name) noexcept {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+float environment_float(const char* name, float fallback, float minimum, float maximum) noexcept {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const float parsed = std::strtof(value, &end);
+  if (errno != 0 || end == value || !std::isfinite(parsed)) {
+    return fallback;
+  }
+  return std::clamp(parsed, minimum, maximum);
+}
+
 const bool g_enabled = environment_flag("AURORA_MODERN_SCENE_POC");
 const bool g_ignoreDepth = environment_flag("AURORA_MODERN_SCENE_IGNORE_DEPTH");
+const bool g_diagnostic = environment_flag("AURORA_MODERN_SCENE_DIAGNOSTIC");
+
+SceneParams build_scene_params() noexcept {
+  return {
+      .translationScale = {
+          environment_float("AURORA_MODERN_SCENE_X", 0.0f, -100000.0f, 100000.0f),
+          environment_float("AURORA_MODERN_SCENE_Y", 0.0f, -100000.0f, 100000.0f),
+          environment_float("AURORA_MODERN_SCENE_Z", -650.0f, -100000.0f, 100000.0f),
+          environment_float("AURORA_MODERN_SCENE_SCALE", 82.0f, 0.01f, 10000.0f),
+      },
+      .material = {
+          environment_float("AURORA_MODERN_SCENE_METALLIC", 0.72f, 0.0f, 1.0f),
+          environment_float("AURORA_MODERN_SCENE_ROUGHNESS", 0.22f, 0.04f, 1.0f),
+          g_diagnostic ? 1.0f : 0.0f,
+          environment_float("AURORA_MODERN_SCENE_EXPOSURE", 1.0f, 0.1f, 8.0f),
+      },
+  };
+}
 
 template <typename T, size_t N>
-wgpu::Buffer create_static_buffer(const std::array<T, N>& source, wgpu::BufferUsage usage, const char* label) {
+wgpu::Buffer create_static_buffer(const std::array<T, N>& source, wgpu::BufferUsage usage,
+                                  const char* label) {
   const wgpu::BufferDescriptor descriptor{
       .label = label,
       .usage = usage,
@@ -93,13 +136,26 @@ wgpu::Buffer create_static_buffer(const std::array<T, N>& source, wgpu::BufferUs
   return buffer;
 }
 
+wgpu::Buffer create_scene_params_buffer() {
+  const SceneParams params = build_scene_params();
+  const wgpu::BufferDescriptor descriptor{
+      .label = "MKart Modern Scene Parameters",
+      .usage = wgpu::BufferUsage::Uniform,
+      .size = sizeof(SceneParams),
+      .mappedAtCreation = true,
+  };
+  auto buffer = g_device.CreateBuffer(&descriptor);
+  std::memcpy(buffer.GetMappedRange(0, sizeof(params)), &params, sizeof(params));
+  buffer.Unmap();
+  return buffer;
+}
+
 void create_geometry() {
-  // Mapped-at-creation avoids a queue write while a render pass is being encoded. These immutable
-  // buffers are initialized once, then shared by every frame without CPU/GPU synchronization.
   g_vertexBuffer = create_static_buffer(kCubeVertices, wgpu::BufferUsage::Vertex,
                                         "MKart Modern Scene Cube Vertices");
   g_indexBuffer = create_static_buffer(kCubeIndices, wgpu::BufferUsage::Index,
                                        "MKart Modern Scene Cube Indices");
+  g_sceneParamsBuffer = create_scene_params_buffer();
 }
 
 void create_pipeline() {
@@ -107,25 +163,31 @@ void create_pipeline() {
   shaderSource.code = R"""(
 const PI: f32 = 3.14159265359;
 
-// This prefix exactly mirrors the stable triangle-draw prefix produced by gx::build_uniform.
-// Five vec4 values consume the first 80 bytes; the GX projection matrix begins at byte 80.
 struct GxCameraUniform {
     header: array<vec4<u32>, 5>,
     projection: mat4x4<f32>,
 };
 
+struct SceneParams {
+    translationScale: vec4<f32>,
+    material: vec4<f32>,
+};
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @builtin(instance_index) instanceIndex: u32,
 };
 
 struct VertexOutput {
     @builtin(position) clipPosition: vec4<f32>,
     @location(0) viewPosition: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) tint: vec3<f32>,
 };
 
 @group(0) @binding(0) var<uniform> gxCamera: GxCameraUniform;
+@group(0) @binding(1) var<uniform> scene: SceneParams;
 
 fn distribution_ggx(n: vec3<f32>, h: vec3<f32>, roughness: f32) -> f32 {
     let a = roughness * roughness;
@@ -161,18 +223,33 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
                  vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+fn diagnostic_translation(index: u32) -> vec3<f32> {
+    if (index == 0u) { return vec3<f32>(-220.0, 0.0, -650.0); }
+    if (index == 1u) { return vec3<f32>( 220.0, 0.0,  650.0); }
+    if (index == 2u) { return vec3<f32>(0.0, -160.0, -260.0); }
+    return vec3<f32>(0.0, 160.0, 260.0);
+}
+
+fn diagnostic_tint(index: u32) -> vec3<f32> {
+    if (index == 0u) { return vec3<f32>(1.0, 0.06, 0.02); }
+    if (index == 1u) { return vec3<f32>(0.02, 0.75, 1.0); }
+    if (index == 2u) { return vec3<f32>(0.10, 1.0, 0.20); }
+    return vec3<f32>(1.0, 0.05, 0.85);
+}
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
+    let diagnostic = scene.material.z > 0.5;
+    let translation = select(scene.translationScale.xyz,
+                             diagnostic_translation(input.instanceIndex), diagnostic);
+    let scale = scene.translationScale.w;
+    let viewPosition = input.position * scale + translation;
 
-    // The first scene milestone is deliberately camera-space geometry. It proves that an arbitrary
-    // indexed 3D mesh can share MKW's projection, viewport and depth attachment. World transforms
-    // are the next bridge and do not require changing this material/pipeline architecture.
-    let viewPosition = input.position * 82.0 + vec3<f32>(185.0, -25.0, -650.0);
     output.viewPosition = viewPosition;
     output.normal = input.normal;
-
-    // Aurora's GX shaders use row-vector multiplication; use the exact same convention and bytes.
+    output.tint = select(vec3<f32>(0.96, 0.23, 0.035),
+                         diagnostic_tint(input.instanceIndex), diagnostic);
     output.clipPosition = vec4<f32>(viewPosition, 1.0) * gxCamera.projection;
     return output;
 }
@@ -184,9 +261,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let l = normalize(vec3<f32>(-0.42, 0.72, 0.55));
     let h = normalize(v + l);
 
-    let baseColor = vec3<f32>(0.96, 0.23, 0.035);
-    let metallic = 0.72;
-    let roughness = 0.22;
+    let baseColor = input.tint;
+    let metallic = scene.material.x;
+    let roughness = scene.material.y;
     let f0 = vec3<f32>(0.04) * (1.0 - metallic) + baseColor * metallic;
 
     let nDotL = max(dot(n, l), 0.0);
@@ -198,9 +275,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = (vec3<f32>(1.0) - fresnel) * (1.0 - metallic) * baseColor / PI;
 
     let direct = (diffuse + specular) * vec3<f32>(5.5, 4.8, 4.2) * nDotL;
-    let ambient = baseColor * 0.055 + f0 * 0.085;
-    let rim = pow(1.0 - nDotV, 3.0) * vec3<f32>(0.35, 0.08, 0.02);
-    let mapped = aces_tonemap(ambient + direct + rim);
+    let ambient = baseColor * 0.07 + f0 * 0.09;
+    let rim = pow(1.0 - nDotV, 3.0) * baseColor * 0.32;
+    let mapped = aces_tonemap((ambient + direct + rim) * scene.material.w);
     let displayColor = pow(mapped, vec3<f32>(1.0 / 2.2));
     return vec4<f32>(displayColor, 1.0);
 }
@@ -212,40 +289,53 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   };
   g_shaderModule = g_device.CreateShaderModule(&shaderDescriptor);
 
-  const std::array cameraEntries{
+  const std::array layoutEntries{
       wgpu::BindGroupLayoutEntry{
           .binding = 0,
           .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
-          .buffer =
-              wgpu::BufferBindingLayout{
-                  .type = wgpu::BufferBindingType::Uniform,
-                  .hasDynamicOffset = true,
-              },
+          .buffer = wgpu::BufferBindingLayout{
+              .type = wgpu::BufferBindingType::Uniform,
+              .hasDynamicOffset = true,
+          },
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+          .buffer = wgpu::BufferBindingLayout{
+              .type = wgpu::BufferBindingType::Uniform,
+              .hasDynamicOffset = false,
+              .minBindingSize = sizeof(SceneParams),
+          },
       },
   };
-  const wgpu::BindGroupLayoutDescriptor cameraLayoutDescriptor{
-      .label = "MKart Modern Scene GX Camera Layout",
-      .entryCount = cameraEntries.size(),
-      .entries = cameraEntries.data(),
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "MKart Modern Scene Layout",
+      .entryCount = layoutEntries.size(),
+      .entries = layoutEntries.data(),
   };
-  g_cameraLayout = g_device.CreateBindGroupLayout(&cameraLayoutDescriptor);
+  g_sceneLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
 
-  const std::array cameraBindEntries{
+  const std::array bindEntries{
       wgpu::BindGroupEntry{
           .binding = 0,
           .buffer = g_uniformBuffer,
           .size = gx::MaxUniformSize,
       },
+      wgpu::BindGroupEntry{
+          .binding = 1,
+          .buffer = g_sceneParamsBuffer,
+          .size = sizeof(SceneParams),
+      },
   };
-  const wgpu::BindGroupDescriptor cameraBindDescriptor{
-      .label = "MKart Modern Scene GX Camera Bind Group",
-      .layout = g_cameraLayout,
-      .entryCount = cameraBindEntries.size(),
-      .entries = cameraBindEntries.data(),
+  const wgpu::BindGroupDescriptor bindDescriptor{
+      .label = "MKart Modern Scene Bind Group",
+      .layout = g_sceneLayout,
+      .entryCount = bindEntries.size(),
+      .entries = bindEntries.data(),
   };
-  g_cameraBindGroup = g_device.CreateBindGroup(&cameraBindDescriptor);
+  g_sceneBindGroup = g_device.CreateBindGroup(&bindDescriptor);
 
-  const std::array layouts{g_cameraLayout};
+  const std::array layouts{g_sceneLayout};
   const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
       .label = "MKart Modern Scene Pipeline Layout",
       .bindGroupLayoutCount = layouts.size(),
@@ -254,16 +344,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   g_pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
 
   const std::array vertexAttributes{
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x3,
-          .offset = 0,
-          .shaderLocation = 0,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x3,
-          .offset = 12,
-          .shaderLocation = 1,
-      },
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = 0, .shaderLocation = 0},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = 12, .shaderLocation = 1},
   };
   const std::array vertexLayouts{
       wgpu::VertexBufferLayout{
@@ -292,24 +374,21 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
   const wgpu::RenderPipelineDescriptor pipelineDescriptor{
       .label = "MKart Modern Scene PBR Pipeline",
       .layout = g_pipelineLayout,
-      .vertex =
-          wgpu::VertexState{
-              .module = g_shaderModule,
-              .entryPoint = "vs_main",
-              .bufferCount = vertexLayouts.size(),
-              .buffers = vertexLayouts.data(),
-          },
-      .primitive =
-          wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
-              .frontFace = wgpu::FrontFace::CCW,
-              .cullMode = wgpu::CullMode::Back,
-          },
+      .vertex = wgpu::VertexState{
+          .module = g_shaderModule,
+          .entryPoint = "vs_main",
+          .bufferCount = vertexLayouts.size(),
+          .buffers = vertexLayouts.data(),
+      },
+      .primitive = wgpu::PrimitiveState{
+          .topology = wgpu::PrimitiveTopology::TriangleList,
+          .frontFace = wgpu::FrontFace::CCW,
+          // Disabled while validating the GX camera convention. Back-face culling is restored once
+          // the handedness is known, avoiding another source of false negatives during bring-up.
+          .cullMode = wgpu::CullMode::None,
+      },
       .depthStencil = &depthState,
-      .multisample =
-          wgpu::MultisampleState{
-              .count = 1,
-          },
+      .multisample = wgpu::MultisampleState{.count = 1},
       .fragment = &fragmentState,
   };
   g_pipeline = g_device.CreateRenderPipeline(&pipelineDescriptor);
@@ -331,8 +410,6 @@ void initialize() noexcept {
 }
 
 bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcept {
-  // Until pass sample-count metadata is carried in the sealed command, only run with MSAA disabled.
-  // Then every main/offscreen render attachment is single-sampled and pipeline compatibility is exact.
   if (g_graphicsConfig.msaaSamples != 1) {
     if (!g_loggedMsaaRejection.exchange(true, std::memory_order_relaxed)) {
       Log.warn("POC rejected scene draws because MSAA sample count is {} (expected 1)",
@@ -341,8 +418,6 @@ bool candidate_draw(const gx::DrawData& draw, const Range& uniformRange) noexcep
     return false;
   }
 
-  // Large non-instanced triangle draws are a cheap, allocation-free proxy for a 3D scene draw.
-  // UI and point/line expansion are normally much smaller or use multiple instances.
   return draw.instanceCount == 1 && draw.indexCount >= kMinimumCandidateIndices &&
          uniformRange.size >= kGxCameraBytes;
 }
@@ -358,8 +433,11 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   }
 
   if (!g_loggedActivation.exchange(true, std::memory_order_relaxed)) {
-    Log.info("POC enabled: msaaSamples={} ignoreDepth={}", g_graphicsConfig.msaaSamples,
-             g_ignoreDepth ? "true" : "false");
+    const SceneParams params = build_scene_params();
+    Log.info("POC enabled: msaaSamples={} ignoreDepth={} diagnostic={} position=({}, {}, {}) scale={} metallic={} roughness={}",
+             g_graphicsConfig.msaaSamples, g_ignoreDepth ? "true" : "false",
+             g_diagnostic ? "true" : "false", params.translationScale[0], params.translationScale[1],
+             params.translationScale[2], params.translationScale[3], params.material[0], params.material[1]);
   }
 
   if (!candidate_draw(draw, effectiveUniformRange)) {
@@ -367,9 +445,9 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
   }
 
   if (!g_loggedCandidate.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Selected GX camera candidate: indices={} instances={} uniformOffset={} uniformSize={}",
-             draw.indexCount, draw.instanceCount, effectiveUniformRange.offset,
-             effectiveUniformRange.size);
+    Log.info("Selected GX camera candidate: indices={} instances={} uniformOffset={} uniformSize={} projectionType={} currentPnMtx={}",
+             draw.indexCount, draw.instanceCount, effectiveUniformRange.offset, effectiveUniformRange.size,
+             static_cast<uint32_t>(draw.scene.projectionType), draw.scene.currentPnMtx);
   }
 
   initialize();
@@ -377,24 +455,20 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
     return;
   }
 
-  // Bind the exact sealed GX uniform range used by the draw we follow. When Aurora replays an
-  // interpolated presentation slot, pipeline.cpp passes the interpolated range here automatically.
   const std::array dynamicOffsets{effectiveUniformRange.offset};
   pass.SetPipeline(g_pipeline);
-  pass.SetBindGroup(0, g_cameraBindGroup, dynamicOffsets.size(), dynamicOffsets.data());
+  pass.SetBindGroup(0, g_sceneBindGroup, dynamicOffsets.size(), dynamicOffsets.data());
   pass.SetVertexBuffer(0, g_vertexBuffer, 0, sizeof(kCubeVertices));
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16, 0, sizeof(kCubeIndices));
-  pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()));
+  const uint32_t instanceCount = g_diagnostic ? 4u : 1u;
+  pass.DrawIndexed(static_cast<uint32_t>(kCubeIndices.size()), instanceCount);
 
   if (!g_loggedDraw.exchange(true, std::memory_order_relaxed)) {
-    Log.info("Issued modern scene DrawIndexed: indices={} cameraUniformOffset={}",
-             kCubeIndices.size(), effectiveUniformRange.offset);
+    Log.info("Issued modern scene DrawIndexed: indices={} instances={} cameraUniformOffset={}",
+             kCubeIndices.size(), instanceCount, effectiveUniformRange.offset);
   }
 
   state.modernSceneDrawn = true;
-
-  // The custom pipeline replaced bindings that GX caches in DrawEncodeState. Invalidate only those
-  // encoder-side memos; the next GX draw will restore its pipeline/index/texture state normally.
   state.currentPipeline = UINTPTR_MAX;
   state.boundTextureBindGroup = nullptr;
   state.indexBufferBound = false;
@@ -403,12 +477,13 @@ void render_after_gx_draw(const gx::DrawData& draw, const Range& effectiveUnifor
 void shutdown() noexcept {
   std::lock_guard lock{g_resourceMutex};
   g_initialized.store(false, std::memory_order_release);
+  g_sceneParamsBuffer = {};
   g_indexBuffer = {};
   g_vertexBuffer = {};
   g_pipeline = {};
   g_pipelineLayout = {};
-  g_cameraBindGroup = {};
-  g_cameraLayout = {};
+  g_sceneBindGroup = {};
+  g_sceneLayout = {};
   g_shaderModule = {};
 }
 
